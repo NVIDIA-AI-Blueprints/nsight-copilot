@@ -162,6 +162,8 @@ OS packages):
    ghcr.io/berriai/litellm             (Apache-2.0 Python dependencies)
    nvcr.io/nim/openai/gpt-oss-120b     (gpt-oss-120b model)
    nvcr.io/nvidia/vllm                 (vLLM runtime)
+   quay.io/coreos/etcd                 (etcd distributed key-value store)
+   milvusdb/milvus                     (Milvus vector database)
 
 Full Apache License, Version 2.0 Text:
 --------------------------------------------------------------------------------
