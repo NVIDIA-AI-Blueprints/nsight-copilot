@@ -505,7 +505,7 @@ services:
     image: curlimages/curl:8.17.0
   vllm-bge:
     command: |
-      vllm serve /models/bge-m3 --gpu-memory-utilization ${BGE_GPU_MEM_UTIL:-0.01}
+      vllm serve /models/bge-m3 --task embedding --gpu-memory-utilization ${BGE_GPU_MEM_UTIL:-0.01}
     depends_on:
       cache-flush-bge:
         condition: service_completed_successfully
