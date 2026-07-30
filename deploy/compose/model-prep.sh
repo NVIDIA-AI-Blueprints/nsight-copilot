@@ -15,6 +15,9 @@
 # limitations under the License.
 set -euo pipefail
 
+# Default to ${PWD}/.cache/huggingface when HF_HOME is unset.
+export HF_HOME=${HF_HOME:-${PWD}/.cache/huggingface}
+
 mkdir -p models
 echo "Downloading models to /offline_inference_data/models..."
 
