@@ -53,33 +53,36 @@ jobs:
           set -euo pipefail
           : "${NGC_API_KEY:?NGC_API_KEY secret missing}"
 
+          # This GPU runner already exposes the host driver to containers via Docker's
+          # NVIDIA runtime (the sibling QA workflows deploy on it the same way), so the
+          # GPUs reach the compose services directly. We deploy with plain
+          # `docker compose up` rather than the DGX Spark bare-metal setup script: that
+          # script tries to install a GPU driver *inside* this runner container, which
+          # can't work (no nvidia-smi in the pod, and kernel modules can't be loaded
+          # from a container) and aborts the job.
           export OFFLINE_INFERENCE_DIR
           export USER_ID="$(id -u)"
-          mkdir -p "${OFFLINE_INFERENCE_DIR}"
+          mkdir -p "${OFFLINE_INFERENCE_DIR}/nim"
+
+          # GPU placement: this runner has 2 discrete GPUs (>=80 GB each, as
+          # gpt-oss-120b requires), so mirror the setup script's multi-GPU layout:
+          # dedicate GPU 0 to the LLM and put the small models (autocomplete, bge,
+          # rerank) on GPU 1. Discrete GPUs use the 2.0.7 gpt-oss image; 1.6.1 is only
+          # for unified-memory DGX Spark. If a run shows the LLM out of memory, the
+          # GPUs are smaller than assumed - revisit this layout.
+          export GPT_OSS_IMAGE_TAG=2.0.7
+          export GPT_OSS_GPU=0
+          export GPT_OSS_KVCACHE_PERCENT=0.9
+          export AUTOCOMPLETE_GPU=1
+          export AUTOCOMPLETE_GPU_MEM_UTIL=0.3
+          export BGE_GPU=1
+          export BGE_GPU_MEM_UTIL=0.05
+          export RERANK_GPU=1
 
           echo "${NGC_API_KEY}" | docker login nvcr.io -u '$oauthtoken' --password-stdin
 
-          # The host GPU driver is exposed to this container, so nvidia-smi is on
-          # PATH for the 'runner' user and the setup script's driver step should be
-          # skipped. But the script runs under sudo, and sudo's secure_path drops the
-          # directory holding nvidia-smi from root's PATH, so the script can't see
-          # the driver, tries to install one inside the container, and fails. Confirm
-          # nvidia-smi is visible here, then forward this PATH into the sudo'd process
-          # (env "PATH=$PATH") so nvidia-smi and GPU detection resolve as root.
-          echo "nvidia-smi resolves to: $(command -v nvidia-smi || echo '<not found>')"
-          nvidia-smi -L || true
-
-          # apt cache refresh is a safety net: if the driver step ever does run, its
-          # apt-get install has no update of its own (the Docker steps that would
-          # refresh the cache are skipped when Docker is preinstalled).
-          sudo apt-get update -qq
-
-          # Automated setup: auto-detects the host GPUs, picks a placement layout
-          # (single-GPU or LLM-on-largest + small-models-on-second), exports the
-          # matching env vars (incl. the host-correct GPT-OSS image tag), and runs
-          # `docker compose -f ${COMPOSE_FILE} up -d`. Idempotent / safe to re-run.
-          curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sudo -E sh
-          sudo -E env "PATH=$PATH" "$(which uv)" run deploy/compose/setup_nsc_with_offline_inference.py
+          # Detached start; the next step waits for the services to report healthy.
+          docker compose -f "${COMPOSE_FILE}" up -d --remove-orphans
 
           # Compose may create the cache bind source as root; normalize ownership
           # so the NIMs (running as USER_ID) can write their caches.
