@@ -59,6 +59,13 @@ jobs:
 
           echo "${NGC_API_KEY}" | docker login nvcr.io -u '$oauthtoken' --password-stdin
 
+          # Refresh the apt package lists before running setup. The setup script's
+          # driver step (apt-get install ubuntu-drivers-common) runs no apt-get
+          # update itself, and its earlier Docker steps are skipped on this runner
+          # (Docker is preinstalled), so the lists can be stale/empty and apt fails
+          # with "Unable to locate package ubuntu-drivers-common".
+          sudo apt-get update -qq
+
           # Automated setup: auto-detects the host GPUs, picks a placement layout
           # (single-GPU or LLM-on-largest + small-models-on-second), exports the
           # matching env vars (incl. the host-correct GPT-OSS image tag), and runs
@@ -102,17 +109,23 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Capture each response into a variable and print a truncated preview.
+          # Piping `curl ... | head -c 1000` under `pipefail` fails the step when the
+          # body exceeds 1000 bytes: head closes the pipe early, curl dies with
+          # SIGPIPE (141), and pipefail propagates that. Slicing a variable avoids
+          # the SIGPIPE while still letting `curl -f` abort on an HTTP error.
           echo "== Chat (GPT-OSS) via primary backend :8080 =="
-          curl -fsS "${SERVER_URL}/v1/chat/completions" \
+          chat_resp="$(curl -fsS "${SERVER_URL}/v1/chat/completions" \
             -H "Content-Type: application/json" \
             -d '{
               "model": "gpt-oss-120b medium reasoning + CUDA knowledge",
               "messages": [{"role": "user", "content": "Write a CUDA kernel that applies ReLU to a float array."}],
               "max_tokens": 256
-            }' | head -c 1000; echo
+            }')"
+          echo "${chat_resp:0:1000}"
 
           echo "== Code completion (CUDA-autocomplete) via primary backend :8080 =="
-          curl -fsS "${SERVER_URL}/v1/completions" \
+          completion_resp="$(curl -fsS "${SERVER_URL}/v1/completions" \
             -H "Content-Type: application/json" \
             -d '{
               "model": "nvidia/CUDA-autocomplete",
@@ -120,10 +133,11 @@ jobs:
               "max_tokens": 32,
               "temperature": 0.01,
               "stop": ["<|endoftext|>", "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>"]
-            }' | head -c 1000; echo
+            }')"
+          echo "${completion_resp:0:1000}"
 
           echo "== Reranking NIM :8020 =="
-          curl -fsS -X POST "${RERANK_URL}/v1/ranking" \
+          rerank_resp="$(curl -fsS -X POST "${RERANK_URL}/v1/ranking" \
             -H "Content-Type: application/json" \
             -d '{
               "model": "nvidia/llama-nemotron-rerank-1b-v2",
@@ -132,7 +146,8 @@ jobs:
                 {"text": "H100 delivers 3 TB/s of memory bandwidth per GPU with NVLink and NVSwitch scalability."},
                 {"text": "A100 can be partitioned into seven GPU instances to adjust to shifting demands."}
               ]
-            }' | head -c 1000; echo
+            }')"
+          echo "${rerank_resp:0:1000}"
 
           echo "Inference endpoints are responding."
 
