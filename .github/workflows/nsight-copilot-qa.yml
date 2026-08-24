@@ -59,11 +59,19 @@ jobs:
 
           echo "${NGC_API_KEY}" | docker login nvcr.io -u '$oauthtoken' --password-stdin
 
-          # Refresh the apt package lists before running setup. The setup script's
-          # driver step (apt-get install ubuntu-drivers-common) runs no apt-get
-          # update itself, and its earlier Docker steps are skipped on this runner
-          # (Docker is preinstalled), so the lists can be stale/empty and apt fails
-          # with "Unable to locate package ubuntu-drivers-common".
+          # The host GPU driver is exposed to this container, so nvidia-smi is on
+          # PATH for the 'runner' user and the setup script's driver step should be
+          # skipped. But the script runs under sudo, and sudo's secure_path drops the
+          # directory holding nvidia-smi from root's PATH, so the script can't see
+          # the driver, tries to install one inside the container, and fails. Confirm
+          # nvidia-smi is visible here, then forward this PATH into the sudo'd process
+          # (env "PATH=$PATH") so nvidia-smi and GPU detection resolve as root.
+          echo "nvidia-smi resolves to: $(command -v nvidia-smi || echo '<not found>')"
+          nvidia-smi -L || true
+
+          # apt cache refresh is a safety net: if the driver step ever does run, its
+          # apt-get install has no update of its own (the Docker steps that would
+          # refresh the cache are skipped when Docker is preinstalled).
           sudo apt-get update -qq
 
           # Automated setup: auto-detects the host GPUs, picks a placement layout
@@ -71,7 +79,7 @@ jobs:
           # matching env vars (incl. the host-correct GPT-OSS image tag), and runs
           # `docker compose -f ${COMPOSE_FILE} up -d`. Idempotent / safe to re-run.
           curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sudo -E sh
-          sudo -E "$(which uv)" run deploy/compose/setup_nsc_with_offline_inference.py
+          sudo -E env "PATH=$PATH" "$(which uv)" run deploy/compose/setup_nsc_with_offline_inference.py
 
           # Compose may create the cache bind source as root; normalize ownership
           # so the NIMs (running as USER_ID) can write their caches.
