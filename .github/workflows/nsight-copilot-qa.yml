@@ -1,0 +1,221 @@
+# Deploys the Nsight Copilot (self-hosted / offline inference) stack via Docker
+# Compose, waits for the inference services and the primary backend to become
+# healthy, exercises the OpenAI-compatible endpoints, then runs the Nsight
+# Copilot test suite from the shared QA image.
+#
+# This blueprint loads its models one at a time on start (single/multi-GPU with
+# memory freed between loads); GPT-OSS alone can take ~15-20 min to initialize,
+# so the readiness waits below are generous and the job timeout is large.
+#
+# Required repository secrets:
+#   NGC_API_KEY            NVIDIA API key used to pull NIM images from nvcr.io
+#                          and download model weights from NGC. Needs access to
+#                          nvcr.io/nim/* and the blueprint model artifacts.
+#   TEST_DOCKER_PULL_KEY   NVIDIA API key with pull access to
+#                          nvcr.io/rw983xdqtcdp/auto_test_team/blueprint-github-test-image.
+#                          If unset, the test step is skipped.
+#
+# Optional SMTP secrets (mail step skipped if any are missing):
+#   SMTP_USERNAME, SMTP_PASSWORD, SMTP_MAIL_TO, SMTP_MAIL_FROM
+
+name: Blueprint QA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nsight-copilot-e2e:
+    name: Nsight Copilot E2E
+    runs-on: arc-runners-org-nvidia-ai-bp-2-gpu
+    timeout-minutes: 480
+    env:
+      NGC_API_KEY: ${{ secrets.NGC_API_KEY }}
+      QA_TEST_IMAGE: nvcr.io/rw983xdqtcdp/auto_test_team/blueprint-github-test-image:latest
+      COMPOSE_FILE: deploy/compose/compose.yaml
+      # Local cache for model weights / vector DB data (>= 200 GB free needed).
+      OFFLINE_INFERENCE_DIR: ${{ github.workspace }}/nsc-offline
+      # Endpoints published by the compose stack (see docs "Service Ports").
+      GATEWAY_URL: http://localhost:8000   # LiteLLM OpenAI-compatible gateway
+      SERVER_URL: http://localhost:8080    # Nsight Copilot primary backend
+      RERANK_URL: http://localhost:8020    # Rerank NIM
+      RAG_URL: http://localhost:8030       # RAG retrieval backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy stack
+        run: |
+          set -euo pipefail
+          : "${NGC_API_KEY:?NGC_API_KEY secret missing}"
+
+          export OFFLINE_INFERENCE_DIR
+          export USER_ID="$(id -u)"
+          mkdir -p "${OFFLINE_INFERENCE_DIR}"
+
+          echo "${NGC_API_KEY}" | docker login nvcr.io -u '$oauthtoken' --password-stdin
+
+          # Automated setup: auto-detects the host GPUs, picks a placement layout
+          # (single-GPU or LLM-on-largest + small-models-on-second), exports the
+          # matching env vars (incl. the host-correct GPT-OSS image tag), and runs
+          # `docker compose -f ${COMPOSE_FILE} up -d`. Idempotent / safe to re-run.
+          curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sudo -E sh
+          sudo -E "$(which uv)" run deploy/compose/setup_nsc_with_offline_inference.py
+
+          # Compose may create the cache bind source as root; normalize ownership
+          # so the NIMs (running as USER_ID) can write their caches.
+          sudo chown -R "$(id -u):$(id -g)" "${OFFLINE_INFERENCE_DIR}" || true
+
+      - name: Wait for services to become healthy
+        run: |
+          set -euo pipefail
+
+          echo "Waiting for the LiteLLM gateway to list models (up to 40 min)..."
+          if ! timeout 2400 bash -c 'until curl -fsS "${GATEWAY_URL}/v1/models" > /dev/null 2>&1; do sleep 15; done'; then
+            echo "::error::LiteLLM gateway did not become ready within 40 minutes."
+            docker compose -f "${COMPOSE_FILE}" ps --all
+            exit 1
+          fi
+
+          echo "Waiting for the rerank and RAG services to report ready (up to 10 min)..."
+          if ! timeout 600 bash -c 'until curl -fsS "${RERANK_URL}/v1/health/ready" > /dev/null 2>&1 && curl -fsS "${RAG_URL}/v1/health/ready" > /dev/null 2>&1; do sleep 10; done'; then
+            echo "::error::Rerank or RAG backend did not become ready within 10 minutes."
+            docker compose -f "${COMPOSE_FILE}" ps --all
+            exit 1
+          fi
+
+          echo "Waiting for the Nsight Copilot primary backend on :8080 (up to 10 min)..."
+          if ! timeout 600 bash -c 'until curl -fsS -o /dev/null "${SERVER_URL}/openapi.json"; do sleep 10; done'; then
+            echo "::error::Nsight Copilot backend (:8080) did not answer within 10 minutes."
+            docker compose -f "${COMPOSE_FILE}" ps --all
+            exit 1
+          fi
+
+          echo "Stack is ready. Current service status:"
+          docker compose -f "${COMPOSE_FILE}" ps --all
+
+      - name: Exercise inference endpoints
+        run: |
+          set -euo pipefail
+
+          echo "== Chat (GPT-OSS) via primary backend :8080 =="
+          curl -fsS "${SERVER_URL}/v1/chat/completions" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "model": "gpt-oss-120b medium reasoning + CUDA knowledge",
+              "messages": [{"role": "user", "content": "Write a CUDA kernel that applies ReLU to a float array."}],
+              "max_tokens": 256
+            }' | head -c 1000; echo
+
+          echo "== Code completion (CUDA-autocomplete) via primary backend :8080 =="
+          curl -fsS "${SERVER_URL}/v1/completions" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "model": "nvidia/CUDA-autocomplete",
+              "prompt": "<|fim_prefix|>__global__ void relu(float* o, const float* i, int n) {\n  int t = blockIdx.x * blockDim.x + threadIdx.x;\n  if (t < n) o[t] = <|fim_suffix|>;\n}\n<|fim_middle|>",
+              "max_tokens": 32,
+              "temperature": 0.01,
+              "stop": ["<|endoftext|>", "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>"]
+            }' | head -c 1000; echo
+
+          echo "== Reranking NIM :8020 =="
+          curl -fsS -X POST "${RERANK_URL}/v1/ranking" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "model": "nvidia/llama-nemotron-rerank-1b-v2",
+              "query": {"text": "What is the memory bandwidth of H100 SXM?"},
+              "passages": [
+                {"text": "H100 delivers 3 TB/s of memory bandwidth per GPU with NVLink and NVSwitch scalability."},
+                {"text": "A100 can be partitioned into seven GPU instances to adjust to shifting demands."}
+              ]
+            }' | head -c 1000; echo
+
+          echo "Inference endpoints are responding."
+
+      # The endpoint probe above performs live inference. Give the shared
+      # inference stack a brief cooldown before the browser/API test suite runs.
+      - name: Cool down inference before tests
+        run: sleep 15
+
+      - name: Run Nsight Copilot tests
+        env:
+          TEST_DOCKER_PULL_KEY: ${{ secrets.TEST_DOCKER_PULL_KEY }}
+        run: |
+          set -euo pipefail
+          [ -n "${TEST_DOCKER_PULL_KEY:-}" ] || exit 0
+          echo "${TEST_DOCKER_PULL_KEY}" | docker login nvcr.io -u '$oauthtoken' --password-stdin
+          docker pull "${QA_TEST_IMAGE}"
+          docker run --rm --net=host -v "$(pwd):/workspace" "${QA_TEST_IMAGE}" \
+            pytest -m nsight_copilot \
+              --nsc-base-url="${GATEWAY_URL}" \
+              --nsc-rerank-url="${RERANK_URL}" \
+              --nsc-repo=/workspace \
+              --reruns=2 --reruns-delay=15 \
+              --disable-warnings -v --timeout=240 \
+              --html=/workspace/nsight-copilot-test.html --self-contained-html
+
+      - name: Capture failure diagnostics
+        if: failure()
+        run: |
+          mkdir -p ci-diagnostics
+          docker compose -f "${COMPOSE_FILE}" ps --all \
+            > ci-diagnostics/docker-compose-ps.txt 2>&1 || true
+          docker compose -f "${COMPOSE_FILE}" logs \
+            --no-color --timestamps --tail 300 \
+            litellm gpt-oss-nim autocomplete-nim rerank-nim vllm-bge \
+            rag-server-offline nsight-copilot-offline \
+            standalone etcd minio \
+            > ci-diagnostics/service-logs.txt 2>&1 || true
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nsight-copilot-test
+          path: |
+            nsight-copilot-test.html
+            ci-diagnostics/
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker compose -f "${COMPOSE_FILE}" down -v --rmi all 2>/dev/null || true
+          docker rmi "${QA_TEST_IMAGE}" 2>/dev/null || true
+          docker image prune -f
+
+      - name: Detect SMTP
+        id: smtp
+        if: always()
+        env:
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_MAIL_TO: ${{ secrets.SMTP_MAIL_TO }}
+          SMTP_MAIL_FROM: ${{ secrets.SMTP_MAIL_FROM }}
+        run: |
+          [ -n "${SMTP_USERNAME:-}${SMTP_PASSWORD:-}${SMTP_MAIL_TO:-}${SMTP_MAIL_FROM:-}" ] \
+            && [ -n "${SMTP_USERNAME:-}" ] && [ -n "${SMTP_PASSWORD:-}" ] \
+            && [ -n "${SMTP_MAIL_TO:-}" ] && [ -n "${SMTP_MAIL_FROM:-}" ] \
+            && echo "enabled=true" >> "$GITHUB_OUTPUT" \
+            || echo "enabled=false" >> "$GITHUB_OUTPUT"
+
+      - name: Send mail
+        if: always() && steps.smtp.outputs.enabled == 'true'
+        uses: dawidd6/action-send-mail@6e71c855c9a091d80a519621b9fd3e8d252ca40c
+        continue-on-error: true
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "QA Test Workflow Result for ${{ github.repository }}"
+          to: ${{ secrets.SMTP_MAIL_TO }}
+          from: ${{ secrets.SMTP_MAIL_FROM }}
+          html_body: |
+            <p>Workflow for <strong>${{ github.repository }}</strong> finished: <strong>${{ job.status }}</strong></p>
+            <p><a href="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}">View run</a></p>
