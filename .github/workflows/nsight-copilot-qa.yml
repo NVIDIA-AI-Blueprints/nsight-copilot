@@ -175,13 +175,21 @@ jobs:
           [ -n "${TEST_DOCKER_PULL_KEY:-}" ] || exit 0
           echo "${TEST_DOCKER_PULL_KEY}" | docker login nvcr.io -u '$oauthtoken' --password-stdin
           docker pull "${QA_TEST_IMAGE}"
-          docker run --rm --net=host -v "$(pwd):/workspace" "${QA_TEST_IMAGE}" \
+          DOCKER_GID="$(stat -c '%g' /var/run/docker.sock)"
+          docker run --rm --net=host \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            --group-add "${DOCKER_GID}" \
+            -v "$(pwd):/workspace" \
+            -w /workspace \
+            -e USER_ID="$(id -u)" \
+            -e NGC_API_KEY \
+            "${QA_TEST_IMAGE}" \
             pytest -m nsight_copilot \
               --nsc-base-url="${GATEWAY_URL}" \
               --nsc-rerank-url="${RERANK_URL}" \
               --nsc-repo=/workspace \
               --reruns=2 --reruns-delay=15 \
-              --disable-warnings -v --timeout=240 \
+              --disable-warnings -v --timeout=600 \
               --html=/workspace/nsight-copilot-test.html --self-contained-html
 
       - name: Capture failure diagnostics
