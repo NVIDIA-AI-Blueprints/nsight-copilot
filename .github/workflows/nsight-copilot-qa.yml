@@ -180,7 +180,6 @@ jobs:
             -v /var/run/docker.sock:/var/run/docker.sock \
             --group-add "${DOCKER_GID}" \
             -v "$(pwd):/workspace" \
-            -w /workspace \
             -e USER_ID="$(id -u)" \
             -e NGC_API_KEY \
             "${QA_TEST_IMAGE}" \
@@ -191,7 +190,7 @@ jobs:
               --reruns=2 --reruns-delay=15 \
               --disable-warnings -v --timeout=600 \
               --html=/workspace/nsight-copilot-test.html --self-contained-html
-
+              
       - name: Capture failure diagnostics
         if: failure()
         run: |
