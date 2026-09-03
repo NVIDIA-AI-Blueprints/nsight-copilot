@@ -316,7 +316,8 @@ def _read_os_release() -> dict[str, str]:
 def step_install_docker() -> None:
     print_step(1, "Install Docker Engine")
 
-    if run_silent(["docker", "--version"]):
+    if run_silent(["docker", "--version"]) and run_silent(["docker", "compose", "version"]):
+        run(["systemctl", "start", "docker"], check=False, status_msg="Ensuring Docker daemon is running...")
         print_skipped("already installed")
         return
 

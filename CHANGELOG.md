@@ -1,3 +1,25 @@
+# Nsight Copilot 26.3.1 (3 September 2026)
+
+Various improvements
+
+## New Features
+
+-
+
+## Improvements
+
+- Prompt truncation improvements make chat completions run faster.
+- Log response body for failed RAG API calls.
+- Improved input validation for RAG API calls.
+- Upgraded python dependencies.
+- Improved RAG error reporting.
+- Updated RAG corpus.
+- Improved input validation for MCP calls.
+- Use compose healthcheck service for Nsight Copilot server.
+
+## Bug Fixes
+- Healthcheck endpoint no longer polls components that aren't part of the deployment.
+
 # Nsight Copilot 26.2.1 (19 July 2026)
 
 Multi-GPU support
