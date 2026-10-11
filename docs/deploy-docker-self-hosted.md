@@ -302,7 +302,7 @@ it to ground answers in current, authoritative CUDA material.
 | RAG server | 8030 | Direct CUDA document retrieval backend |
 | Nsight Copilot server | 8080 | Primary backend API for IDE clients and API users |
 | Milvus | 19530, 9091 | Vector database and health endpoint |
-| MinIO | 9000, 9001 | Object storage API and console |
+| SILO | 9000, 9001 | Object storage API and console |
 
 ## Local Data and Privacy
 

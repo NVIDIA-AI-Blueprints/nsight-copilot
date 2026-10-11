@@ -1,3 +1,21 @@
+# Nsight Copilot 26.4.1 (11 October 2026)
+
+Various improvements
+
+## New Features
+
+-
+
+## Improvements
+
+- Updated RAG corpus.
+- Upgraded python dependencies.
+- Upgraded base image.
+
+## Bug Fixes
+
+- Replaced MinIO for SILO.
+
 # Nsight Copilot 26.3.1 (3 September 2026)
 
 Various improvements
@@ -18,6 +36,7 @@ Various improvements
 - Use compose healthcheck service for Nsight Copilot server.
 
 ## Bug Fixes
+
 - Healthcheck endpoint no longer polls components that aren't part of the deployment.
 
 # Nsight Copilot 26.2.1 (19 July 2026)
