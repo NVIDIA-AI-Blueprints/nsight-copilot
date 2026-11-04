@@ -595,16 +595,11 @@ def step_configure_nvidia_ctk() -> None:
 # GPU detection and placement
 # ---------------------------------------------------------------------------
 #
-# compose.yaml pins each GPU service to one GPU via device_ids (default "0" — the
-# single-GPU / DGX Spark layout). On a multi-GPU host we dedicate the largest GPU
-# to the LLM and the next to the small models, published as env vars the compose
-# interpolates; the user configures nothing. A multi-GPU host needs one GPU ≥80 GB
-# for the LLM plus a second for the small models; a single-GPU host needs one GPU
-# big enough for everything (LLM + small models). Hosts that don't qualify are
-# reported unsupported and setup aborts early — instead of crashing at serve time —
-# since tensor-parallel serving across smaller GPUs isn't wired yet (it would need a
-# device_ids *list*, which an env var can't express, and NVIDIA_VISIBLE_DEVICES is
-# ignored under a device reservation).
+# compose.yaml pins each GPU service to one GPU via device_ids (default "0"). All
+# models (bge, rerank) run on GPU 0 on every host; other GPUs stay idle. The compose
+# defaults target DGX Spark (unified memory). On a discrete GPU the script raises the
+# bge memory fraction, because the Spark value is too small there. Hosts whose GPU 0
+# is too small are reported unsupported and setup aborts early.
 
 NVIDIA_SMI_QUERY = [
     "nvidia-smi",
@@ -616,31 +611,15 @@ NVIDIA_SMI_QUERY = [
 # empty, which select_gpu_profile treats as "no GPU" and the caller aborts.
 NVIDIA_SMI_TIMEOUT_SECONDS = 15
 
-# Per-GPU floor for gpt-oss-120b on its own GPU. The NIM manifest tags the TP1
-# profile ">=96 GB/gpu" for the default (huge) context, but compose caps the context
-# (NIM_MAX_MODEL_LEN=32768), which bounds the KV cache — it then runs comfortably on
-# an 80 GB H100 (~75 GB used, validated). NIM compares decimal GB. An 80 GB H100
-# clears this; a 48 GB L40S does not.
-LLM_MIN_GPU_GB = 80
+# Floor for GPU 0, which holds bge + rerank. ponytail: carried over from the old
+# small-model floor (which also held a 7B model); lower it after hardware validation.
+MIN_GPU_GB = 24
 
-# The small models (autocomplete ~7B, bge, rerank) share one GPU; below this their
-# memory fractions don't leave room for the 7B. A single-GPU host must hold the LLM
-# AND these together, so its floor is LLM_MIN_GPU_GB + SMALL_MODELS_MIN_GB.
-SMALL_MODELS_MIN_GB = 24
-
-# gpt-oss-120b is MXFP4, which needs Hopper or newer (compute capability >= 9.0);
-# Ampere (8.x) can't run it regardless of memory. Gating on this turns an 80 GB
-# A100 from a late NIM crash into an early, clear abort.
-MIN_COMPUTE_CAPABILITY = 9.0
-
-# gpt-oss NIM image tag is host-dependent. NIM 2.0.x has a memory runaway on GB10
-# unified memory (DGX Spark): the KV allocation ignores every limiter (util,
-# absolute blocks, enforce-eager) and consumes the whole 128 GB pool → the host
-# hangs. 1.6.1 runs there. On discrete GPUs (H100/GH200) 2.0.x works and 1.6.1
-# does not. So use 1.6.1 on unified-memory hosts and 2.0.7 everywhere else.
-# (Drop the split once NVIDIA ships a UMA-aware 2.0.x.)
-GPT_OSS_IMAGE_TAG_DISCRETE = "2.0.7"
-GPT_OSS_IMAGE_TAG_UNIFIED = "1.6.1"
+# vLLM sizes bge by a fraction of GPU memory, but bge needs a fixed amount: its
+# weights take 1.06 GiB, and the compose default 0.01 (~1.2 GiB of the Spark pool)
+# works on Spark. On a discrete GPU we derive the fraction from this budget
+# (~1.7x the Spark one) so it fits on any size.
+BGE_MEMORY_MIB = 2048
 
 _BYTES_PER_MIB = 1024 * 1024
 _BYTES_PER_GB = 1_000_000_000
@@ -655,18 +634,6 @@ def _gpu_meets(memory_mib: int | None, min_gb: int) -> bool:
     if memory_mib is None:
         return False
     return memory_mib * _BYTES_PER_MIB >= min_gb * _BYTES_PER_GB
-
-
-def _can_run_llm(gpu: "GPUInfo") -> bool:
-    """False only when the GPU is positively known too old for the LLM (MXFP4 needs
-    cc >= 9.0). Unknown/unparseable compute capability is allowed — let NIM judge.
-    """
-    if gpu.compute_capability is None:
-        return True
-    try:
-        return float(gpu.compute_capability) >= MIN_COMPUTE_CAPABILITY
-    except ValueError:
-        return True
 
 
 @dataclass(frozen=True)
@@ -727,80 +694,29 @@ def detect_gpus() -> list[GPUInfo]:
     return parse_nvidia_smi(result.stdout.decode(errors="replace"))
 
 
-def _placement_env(llm_gpu: GPUInfo, small_gpu: GPUInfo, kvcache_percent: str) -> dict[str, str]:
-    """Build the env overrides for a dedicated LLM GPU + a small-model GPU."""
-    return {
-        "GPT_OSS_GPU": str(llm_gpu.index),
-        "GPT_OSS_KVCACHE_PERCENT": kvcache_percent,
-        "AUTOCOMPLETE_GPU": str(small_gpu.index),
-        "AUTOCOMPLETE_GPU_MEM_UTIL": "0.3",
-        "BGE_GPU": str(small_gpu.index),
-        "BGE_GPU_MEM_UTIL": "0.05",
-        "RERANK_GPU": str(small_gpu.index),
-    }
-
-
 def select_gpu_profile(gpus: list[GPUInfo]) -> tuple[str, dict[str, str]]:
-    """Choose GPU-placement env overrides from detected hardware.
+    """Choose GPU env overrides from detected hardware. All models run on GPU 0.
 
     Returns ``(profile_name, env_overrides)``:
-      * ``single-gpu`` (empty overrides) — use compose defaults; one adequate GPU
-        (e.g. DGX Spark).
-      * ``multi-gpu`` — dedicate a GPU to the LLM (the largest that can run it), a
-        second to the small models.
+      * ``unified-memory`` (empty overrides) — GPU 0 reports no memory (GB10 / DGX
+        Spark); use compose defaults.
+      * ``discrete`` — GPU 0 clears MIN_GPU_GB; raise the bge memory fraction.
       * ``no-gpu`` — nvidia-smi reported nothing usable; the caller should abort.
-      * ``unsupported`` — GPUs present but too small or too old for the LLM; abort.
+      * ``unsupported`` — GPU 0 is below MIN_GPU_GB; abort.
     """
     if len(gpus) == 0:
         # No usable GPU (nvidia-smi missing/errored/timed out, or zero GPUs). The
         # whole stack is GPU-bound and the driver step already ran, so an empty
         # result here is a real problem — fail fast rather than crash at serve time.
         return "no-gpu", {}
-
-    # Sort by memory, largest first; unknown memory (None) ranks last.
-    ranked = sorted(gpus, key=lambda g: g.memory_mib if g.memory_mib is not None else -1, reverse=True)
-
-    if len(gpus) == 1:
-        # One GPU runs everything, so it must be new enough for the LLM and hold the
-        # LLM + small models together. If its memory is unknown (e.g. GB10 unified
-        # memory reports [N/A]), assume the Spark single-GPU layout and use compose
-        # defaults; otherwise require it to fit the full stack, else abort early.
-        only = gpus[0]
-        fits = only.memory_mib is None or _gpu_meets(only.memory_mib, LLM_MIN_GPU_GB + SMALL_MODELS_MIN_GB)
-        if _can_run_llm(only) and fits:
-            return "single-gpu", {}
-        return "unsupported", {}
-
-    # Multi-GPU: dedicate one GPU to the LLM and put the small models on another.
-    # Prefer the largest GPU for the LLM, but it must be new enough (MXFP4 needs
-    # Hopper+) and meet the LLM floor — so if the largest is too old/small, fall
-    # through to a lower-ranked eligible GPU rather than vetoing the layout. The small
-    # models go on any other GPU that meets their floor (any arch is fine); an extra
-    # tiny GPU that meets neither just sits idle.
-    chosen_llm = next(
-        (g for g in ranked if _can_run_llm(g) and _gpu_meets(g.memory_mib, LLM_MIN_GPU_GB)),
-        None,
-    )
-    if chosen_llm is not None:
-        chosen_small = next(
-            (g for g in ranked if g is not chosen_llm and _gpu_meets(g.memory_mib, SMALL_MODELS_MIN_GB)),
-            None,
-        )
-        if chosen_small is not None:
-            return "multi-gpu", _placement_env(chosen_llm, chosen_small, "0.9")
+    gpu0 = gpus[0]
+    if gpu0.memory_mib is None:
+        return "unified-memory", {}
+    if _gpu_meets(gpu0.memory_mib, MIN_GPU_GB):
+        # Round the percentage up (integer ceil) so the budget never falls short.
+        bge_percent = -(-BGE_MEMORY_MIB * 100 // gpu0.memory_mib)
+        return "discrete", {"BGE_GPU_MEM_UTIL": f"{bge_percent / 100:.2f}"}
     return "unsupported", {}
-
-
-def select_gpt_oss_image_tag(gpus: list[GPUInfo]) -> str:
-    """Pick the gpt-oss NIM image tag for the host.
-
-    Unified-memory GPUs (GB10 / DGX Spark — the ones reporting memory as [N/A], i.e.
-    ``memory_mib is None``) hit NIM 2.0.x's memory runaway that hangs the host, so
-    pin 1.6.1 there. Discrete GPUs use 2.0.7 (2.0.x works, 1.6.1 doesn't).
-    """
-    if any(g.memory_mib is None for g in gpus):
-        return GPT_OSS_IMAGE_TAG_UNIFIED
-    return GPT_OSS_IMAGE_TAG_DISCRETE
 
 
 # ---------------------------------------------------------------------------
@@ -850,21 +766,12 @@ def _report_gpu_profile(gpus: list[GPUInfo], profile_name: str, overrides: dict[
     else:
         console.print("  [yellow]No GPUs detected via nvidia-smi.[/yellow]")
 
-    console.print(f"  GPU placement profile = [cyan]{profile_name}[/cyan]")
+    console.print(f"  GPU profile = [cyan]{profile_name}[/cyan]")
 
     if profile_name == "unsupported":
-        console.print(
-            "  [yellow]This host's GPUs can't run the models (too small, or too old "
-            "for the LLM — needs Hopper+).[/yellow]"
-        )
-    elif overrides:
-        console.print(
-            f"  [dim]LLM dedicated to GPU {overrides['GPT_OSS_GPU']}; "
-            f"small models on GPU {overrides['AUTOCOMPLETE_GPU']}.[/dim]"
-        )
-        idle = len(gpus) - 2  # LLM GPU + the small-model GPU
-        if idle > 0:
-            console.print(f"  [dim]{idle} additional GPU(s) left idle.[/dim]")
+        console.print(f"  [yellow]GPU 0 has less than {MIN_GPU_GB} GB of memory.[/yellow]")
+    elif len(gpus) > 1:
+        console.print(f"  [dim]All models run on GPU 0; {len(gpus) - 1} GPU(s) left idle.[/dim]")
 
     for key, value in overrides.items():
         console.print(f"    [dim]{key}={value}[/dim]")
@@ -955,20 +862,17 @@ def step_setup_env_vars(uid: int, gid: int, home: Path) -> dict[str, str]:
     gpus = detect_gpus()
     profile_name, gpu_overrides = select_gpu_profile(gpus)
     rerank_overrides = select_rerank_profile(platform.machine(), gpus)
-    gpt_oss_image_tag = select_gpt_oss_image_tag(gpus)
 
     env_vars = {
         "NGC_API_KEY": ngc_api_key,
         "OFFLINE_INFERENCE_DIR": str(offline_dir),
         "USER_ID": user_id,
-        "GPT_OSS_IMAGE_TAG": gpt_oss_image_tag,
         **gpu_overrides,
         **rerank_overrides,
     }
 
     console.print(f"  OFFLINE_INFERENCE_DIR = [cyan]{offline_dir}[/cyan]")
     console.print(f"  USER_ID = [cyan]{user_id}[/cyan]")
-    console.print(f"  gpt-oss NIM image tag = [cyan]{gpt_oss_image_tag}[/cyan]")
     _report_gpu_profile(gpus, profile_name, gpu_overrides)
 
     # Abort early instead of launching a layout that can't work and crashing deep
@@ -981,10 +885,8 @@ def step_setup_env_vars(uid: int, gid: int, home: Path) -> dict[str, str]:
         sys.exit(1)
     if profile_name == "unsupported":
         console.print(
-            "  [red]This host's GPUs can't run the models (too small, or too old for "
-            "the LLM — gpt-oss-120b needs Hopper+). See the hardware requirements in "
-            "the README. Use suitable hardware, or set up tensor-parallel serving "
-            "across GPUs in compose.yaml, then re-run.[/red]"
+            f"  [red]GPU 0 is too small to run the models (needs ≥ {MIN_GPU_GB} GB). "
+            "See the hardware requirements in the README.[/red]"
         )
         sys.exit(1)
 
@@ -1033,7 +935,7 @@ def step_docker_login(ngc_api_key: str, docker_config_dir: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-KEY_SERVICES = {"gpt-oss-nim", "autocomplete-nim", "vllm-bge", "rerank-nim", "litellm"}
+KEY_SERVICES = {"vllm-bge", "rerank-nim", "litellm"}
 HEALTH_POLL_INTERVAL_SECONDS = 15
 
 

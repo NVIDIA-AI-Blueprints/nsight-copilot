@@ -1,10 +1,27 @@
+# Nsight Copilot 26.5.1 (4 October 2026)
+
+Remove Nsight Copilot Visual Studio Code extension - deployment is now MCP only.
+
+## New Features
+
+- Detect corpus changes and update corpus.
+
+## Improvements
+
+- Upgraded python dependencies.
+- Cut RAG requests canceled by Nsight Copilot.
+
+## Bug Fixes
+
+- None.
+
 # Nsight Copilot 26.4.1 (11 October 2026)
 
 Various improvements
 
 ## New Features
 
--
+- None.
 
 ## Improvements
 
@@ -22,7 +39,7 @@ Various improvements
 
 ## New Features
 
--
+- None.
 
 ## Improvements
 
