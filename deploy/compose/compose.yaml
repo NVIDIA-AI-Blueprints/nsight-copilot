@@ -1,98 +1,7 @@
 services:
-  autocomplete-nim:
-    command: |
-      nim-serve --max-model-len 4096 --gpu-memory-utilization ${AUTOCOMPLETE_GPU_MEM_UTIL:-0.15} --enable-prefix-caching
-    depends_on:
-      cache-flush-autocomplete:
-        condition: service_completed_successfully
-        required: true
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - capabilities:
-                - gpu
-              device_ids:
-                - ${AUTOCOMPLETE_GPU:-0}
-    environment:
-      NGC_API_KEY: ${NGC_API_KEY}
-      NIM_LOG_LEVEL: WARNING
-      NIM_MODEL_PATH: ${NIM_AUTOCOMPLETE_MODEL_URI:-ngc://nvidia/blueprint/cuda-autocomplete:0.3.0}
-      NIM_SERVED_MODEL_NAME: nvdev/sw-gpu/qwen-2.5-7b-atlas
-    healthcheck:
-      interval: 30s
-      retries: 10
-      start_period: 180s
-      test:
-        - CMD
-        - curl
-        - -f
-        - http://localhost:8000/v1/models
-      timeout: 10s
-    image: nvcr.io/nim/nvidia/model-free-nim:2.0.4
-    ipc: host
-    ports:
-      - mode: ingress
-        protocol: tcp
-        published: "8011"
-        target: 8000
-    ulimits:
-      memlock: -1
-      stack: 67108864
-    user: ${USER_ID}
-    volumes:
-      - source: ${OFFLINE_INFERENCE_DIR:-~/.cache}/nim
-        target: /opt/nim/.cache
-        type: bind
-  autocomplete-nim-cache:
-    command: |
-      --model-uri ${NIM_AUTOCOMPLETE_MODEL_URI:-ngc://nvidia/blueprint/cuda-autocomplete:0.3.0} --model-cache-path /opt/nim/.cache --use-cache
-    depends_on:
-      gpt-oss-nim-cache:
-        condition: service_completed_successfully
-        required: true
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - capabilities:
-                - gpu
-              device_ids:
-                - ${AUTOCOMPLETE_GPU:-0}
-    entrypoint:
-      - download-to-cache
-    environment:
-      NGC_API_KEY: ${NGC_API_KEY}
-    image: nvcr.io/nim/nvidia/model-free-nim:2.0.4
-    restart: "no"
-    user: ${USER_ID}
-    volumes:
-      - source: ${OFFLINE_INFERENCE_DIR:-~/.cache}/nim
-        target: /opt/nim/.cache
-        type: bind
-  cache-flush-autocomplete:
-    command: sh -c "sync && echo 3 > /proc/sys/vm/drop_caches && free -h"
-    container_name: cache_flush_autocomplete
-    depends_on:
-      test-gpt-oss:
-        condition: service_completed_successfully
-        required: true
-    image: alpine:3.23.0
-    privileged: true
-    restart: "no"
   cache-flush-bge:
     command: sh -c "sync && echo 3 > /proc/sys/vm/drop_caches && free -h"
     container_name: cache_flush_bge
-    depends_on:
-      test-autocomplete:
-        condition: service_completed_successfully
-        required: true
-    image: alpine:3.23.0
-    privileged: true
-    restart: "no"
-  cache-flush-gpt-oss:
-    command: sh -c "sync && echo 3 > /proc/sys/vm/drop_caches && free -h"
-    container_name: cache_flush_gpt_oss
     depends_on:
       model-prep:
         condition: service_completed_successfully
@@ -138,67 +47,6 @@ services:
           create_host_path: true
         source: ./etcd/data
         target: /etcd
-        type: bind
-  gpt-oss-nim:
-    depends_on:
-      cache-flush-gpt-oss:
-        condition: service_completed_successfully
-        required: true
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - capabilities:
-                - gpu
-              device_ids:
-                - ${GPT_OSS_GPU:-0}
-    environment:
-      NGC_API_KEY: ${NGC_API_KEY}
-      NIM_KVCACHE_PERCENT: ${GPT_OSS_KVCACHE_PERCENT:-0.65}
-      NIM_MAX_MODEL_LEN: ${GPT_OSS_MAX_MODEL_LEN:-32768}
-    healthcheck:
-      interval: 30s
-      retries: 10
-      start_period: 20m
-      test:
-        - CMD
-        - curl
-        - -f
-        - http://localhost:8000/v1/health/ready
-      timeout: 10s
-    image: nvcr.io/nim/openai/gpt-oss-120b:${GPT_OSS_IMAGE_TAG:-1.6.1}
-    ports:
-      - mode: ingress
-        protocol: tcp
-        published: "8010"
-        target: 8000
-    shm_size: 16g
-    user: ${USER_ID}
-    volumes:
-      - source: ${OFFLINE_INFERENCE_DIR:-~/.cache}/nim
-        target: /opt/nim/.cache
-        type: bind
-  gpt-oss-nim-cache:
-    command: |
-      --profiles --model-cache-path /opt/nim/.cache --use-cache
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - capabilities:
-                - gpu
-              device_ids:
-                - ${GPT_OSS_GPU:-0}
-    entrypoint:
-      - download-to-cache
-    environment:
-      NGC_API_KEY: ${NGC_API_KEY}
-    image: nvcr.io/nim/openai/gpt-oss-120b:${GPT_OSS_IMAGE_TAG:-1.6.1}
-    restart: "no"
-    user: ${USER_ID}
-    volumes:
-      - source: ${OFFLINE_INFERENCE_DIR:-~/.cache}/nim
-        target: /opt/nim/.cache
         type: bind
   litellm:
     command: --config /app/config.yaml --port 8000
@@ -292,7 +140,7 @@ services:
         - -c
         - import urllib.request; urllib.request.urlopen('http://localhost:8080/healthcheck')
       timeout: 5s
-    image: nvcr.io/nvidia/blueprint/nsight-copilot:1.4.0
+    image: nvcr.io/nvidia/blueprint/nsight-copilot:1.5.0
     ports:
       - mode: ingress
         protocol: tcp
@@ -305,8 +153,6 @@ services:
         condition: service_healthy
         required: true
     environment:
-      DTAI_CODE_SUMMARIZATION_MODEL: ${CODE_SUMMARIZATION_MODEL:-nvdev/sw-gpu/gpt-oss-120b}
-      DTAI_DEFAULT_LLM: ${DEFAULT_LLM:-nvdev/sw-gpu/gpt-oss-120b}
       DTAI_ENABLE_TRACING: ${ENABLE_TRACING:-false}
       DTAI_GITHUB_TOKEN: ${GITHUB_TOKEN:-local-dummy-key}
       DTAI_INFERENCE_URI: ${INFERENCE_URI:-http://litellm:8000/v1}
@@ -320,7 +166,6 @@ services:
       DTAI_RERANKER_BASE_URL: ${RERANKER_BASE_URL:-http://rerank-nim:8000/v1}
       DTAI_RERANKER_MODEL_NAME: ${RERANKER_MODEL_NAME:-nvidia/llama-nemotron-rerank-1b-v2}
       DTAI_RERANKER_TOP_N: ${RERANKER_TOP_N:-2}
-      DTAI_TOOL_CALL_PLANNER__LLM__MODEL_NAME: ${TOOL_CALL_PLANNER_LLM_MODEL_NAME:-nvdev/sw-gpu/gpt-oss-120b}
       DTAI_embedding__default__base_uri: ${EMBEDDING_URI:-http://litellm:8000/v1}
       DTAI_embedding__default__model_type: ${EMBED_MODEL_TYPE:-local}
     healthcheck:
@@ -333,7 +178,7 @@ services:
         - -f
         - http://localhost:8000/v1/health/ready
       timeout: 10s
-    image: nvcr.io/nvidia/blueprint/nsight-copilot-rag:1.4.0
+    image: nvcr.io/nvidia/blueprint/nsight-copilot-rag:1.5.0
     ports:
       - mode: ingress
         protocol: tcp
@@ -351,7 +196,7 @@ services:
             - capabilities:
                 - gpu
               device_ids:
-                - ${RERANK_GPU:-0}
+                - "0"
     environment:
       - NGC_API_KEY=${NGC_API_KEY}
       - NIM_HTTP_MAX_WORKERS=2
@@ -382,7 +227,7 @@ services:
     command: |
       --profiles --model-cache-path /opt/nim/.cache --use-cache
     depends_on:
-      autocomplete-nim-cache:
+      model-prep:
         condition: service_completed_successfully
         required: true
     deploy:
@@ -392,7 +237,7 @@ services:
             - capabilities:
                 - gpu
               device_ids:
-                - ${RERANK_GPU:-0}
+                - "0"
     entrypoint:
       - download-to-cache
     environment:
@@ -453,29 +298,6 @@ services:
         source: ./milvus/data
         target: /var/lib/milvus
         type: bind
-  test-autocomplete:
-    command: |
-      sh -c '
-        echo "Testing autocomplete completions endpoint...";
-        response="$$(curl -f -s --max-time 60 -X POST http://autocomplete-nim:8000/v1/completions \
-          -H "Content-Type: application/json" \
-          -d "{\"model\": \"nvdev/sw-gpu/qwen-2.5-7b-atlas\", \"prompt\": \"def add(a, b):\\n    return\", \"max_tokens\": 8, \"temperature\": 0, \"stop\": [\"\\n\\n\", \"\\ndef\", \"\\nclass\"]}")" || exit 1
-
-        case "$$response" in
-          *\"choices\"*\"text\"*)
-            echo "autocomplete completions test passed"
-            ;;
-          *)
-            echo "$$response"
-            exit 1
-            ;;
-        esac
-      '
-    depends_on:
-      autocomplete-nim:
-        condition: service_healthy
-        required: true
-    image: curlimages/curl:8.17.0
   test-bge:
     command: |
       sh -c '
@@ -487,20 +309,6 @@ services:
       '
     depends_on:
       vllm-bge:
-        condition: service_healthy
-        required: true
-    image: curlimages/curl:8.17.0
-  test-gpt-oss:
-    command: |
-      sh -c '
-        echo "Testing GPT-OSS service...";
-        curl -f -s -X POST http://gpt-oss-nim:8000/v1/chat/completions \
-          -H "Content-Type: application/json" \
-          -d "{\"model\": \"openai/gpt-oss-120b\", \"messages\": [{\"role\": \"user\", \"content\": \"Hello\"}]}" \
-          && echo "GPT-OSS test passed" || exit 1
-      '
-    depends_on:
-      gpt-oss-nim:
         condition: service_healthy
         required: true
     image: curlimages/curl:8.17.0
@@ -532,7 +340,7 @@ services:
             - capabilities:
                 - gpu
               device_ids:
-                - ${BGE_GPU:-0}
+                - "0"
     healthcheck:
       interval: 30s
       retries: 10

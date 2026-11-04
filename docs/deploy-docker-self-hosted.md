@@ -1,24 +1,22 @@
 # Deploy with Docker Compose
 
-Use this guide to deploy the NVIDIA Nsight Copilot Blueprint with Docker Compose on a single DGX Spark.
+Use this guide to deploy the NVIDIA Nsight Copilot Blueprint with Docker Compose.
 
-This deployment provides the local backend for the Nsight Copilot Visual Studio Code extension. After required images and model artifacts are available on the DGX Spark, the extension can use the self-hosted backend without sending prompts or code to an external service.
+This deployment provides a local Model Context Protocol (MCP) server for CUDA documentation search. After required images and model artifacts are available on the server, MCP clients can use the self-hosted server without sending prompts or code to an external service.
 
-First startup on DGX Spark can take tens of minutes — a one-time cost of pulling the container images and downloading the model weights from NGC into `OFFLINE_INFERENCE_DIR`. Restarts reuse the cached weights and skip the download.
+First startup can take tens of minutes — a one-time cost of pulling the container images and downloading the model weights from NGC into `OFFLINE_INFERENCE_DIR`. Restarts reuse the cached weights and skip the download.
 
-On every start, including restarts, the services load the models one at a time, because the single GPU and 128 GB of unified memory (shared between CPU and GPU) cannot hold them all at once; memory is freed between each load. GPT-OSS is the slowest to load, around 15 minutes (engine initialization, compilation, CUDA graph capture, and KV-cache setup), and the other models are faster.
+On every start, including restarts, the services load the models one at a time to avoid memory issues & memory is freed between each load.
 
 ## Supported hardware
 
-The blueprint is tuned for DGX Spark by default and the setup script auto-detects the host's GPUs to choose a placement layout — no manual configuration is required:
+The blueprint is tuned for DGX Spark by default and the setup script auto-detects the host's GPUs — no manual configuration is required. All models (embedding and reranker) run on GPU `0`; any further GPUs are left idle.
 
 | Host | Layout |
 | --- | --- |
-| **Single GPU large enough for everything (e.g. DGX Spark, 128 GB unified)** | All models share the one GPU; per-model memory fractions are sized to fit the shared pool. |
-| **Multi-GPU with a GPU ≥ 80 GB for the LLM + a second GPU (e.g. 2× H100, dual GH200)** | GPT-OSS gets a dedicated GPU (the largest) with a larger KV cache; the autocomplete (7B), embedding, and reranker models are packed onto a second GPU. Any further GPUs are left idle. |
-| **GPUs too small (a single 80 GB GPU, or all GPUs below the floor)** | No automatic layout fits, so the setup script stops with guidance — use suitable hardware or configure tensor-parallel serving manually (it is not set up automatically). |
-
-GPT-OSS runs on a single GPU (TP=1) rather than tensor-parallel across GPUs: it fits on one GPU (the ~63 GB MXFP4 weights plus KV cache; compose caps the context with `NIM_MAX_MODEL_LEN` so it runs in ~75 GB on an 80 GB GPU), so the NCCL communication overhead of splitting it outweighs the bandwidth gain. The same reasoning pins the autocomplete model (7B) to a single GPU. On every start the services still load one model at a time so peak memory stays bounded.
+| **DGX Spark (128 GB unified)** | Compose defaults; per-model memory fractions are sized to fit the shared pool. |
+| **Discrete GPU 0 ≥ 24 GB (e.g. H100, GH200)** | The setup script raises the embedding model memory fraction (`BGE_GPU_MEM_UTIL`). |
+| **GPU 0 below 24 GB** | The setup script stops with guidance — use suitable hardware. |
 
 ## Clone the Repository
 
@@ -58,7 +56,7 @@ If you prefer to set things up manually, follow the steps below.
    2. Select **Setup** > **Generate API Key**.
    3. Copy the key (starts with `nvapi-`).
 
-7. Ensure you have at least **200 GB** of free disk space for Docker images, model weights, caches, and vector database data.
+7. Ensure you have at least **100 GB** of free disk space for Docker images, model weights, caches, and vector database data.
 
 ### Start Services
 
@@ -95,43 +93,18 @@ Check your GPUs first:
 nvidia-smi --query-gpu=index,name,memory.total,compute_cap --format=csv
 ```
 
-**1. gpt-oss NIM image tag — `GPT_OSS_IMAGE_TAG`**
+**1. Embedding model memory on discrete GPUs — `BGE_GPU_MEM_UTIL`**
 
-The gpt-oss NIM version is host-conditional:
-
-| Host | Setting |
-|---|---|
-| DGX Spark / any unified-memory GPU (GB10 — memory shows `[N/A]`) | Leave unset (default `1.6.1`). NIM 2.0.x can exhaust the 128 GB unified memory pool and hang the host — there is no memory limiter to bound it. |
-| Discrete GPUs (H100, GH200, …) | `export GPT_OSS_IMAGE_TAG=2.0.7` — 1.6.1 does not run on discrete GPUs. |
-
-**2. Multi-GPU placement**
-
-This layout applies only when **one** GPU is **Hopper or newer** (compute
-capability ≥ 9.0) **and ≥ 80 GB** to hold the LLM, **and a second** GPU is **≥ 24
-GB** for the small models. Dedicate that largest GPU to the LLM and put
-autocomplete, embedding, and reranking on the second — using each GPU's `index`
-column from `nvidia-smi`. Example — GPU `0` is the ≥ 80 GB LLM GPU, GPU `1` holds
-the small models:
+The default (`0.01`) is sized for the DGX Spark 128 GB unified pool. On a discrete
+GPU (memory shows a number, not `[N/A]`), give the embedding model about 2 GiB:
+set the fraction to 2048 divided by GPU 0 `memory.total` in MiB, rounded up to two
+decimals. Example for an 80 GB GPU (81559 MiB):
 
 ```bash
-export GPT_OSS_GPU=0
-export GPT_OSS_KVCACHE_PERCENT=0.9
-export AUTOCOMPLETE_GPU=1
-export AUTOCOMPLETE_GPU_MEM_UTIL=0.3
-export BGE_GPU=1
-export BGE_GPU_MEM_UTIL=0.05
-export RERANK_GPU=1
+export BGE_GPU_MEM_UTIL=0.03
 ```
 
-On a **single-GPU** host (DGX Spark), leave all of these unset — the defaults run
-every model on GPU `0` with Spark-tuned memory fractions.
-
-If **no single GPU clears 80 GB** (e.g. several 48 GB cards), this blueprint has no
-supported layout: the LLM would need tensor-parallel serving across GPUs, which is
-not configured here and must be set up manually. The automated setup script stops
-with guidance in that case.
-
-**3. Reranker model profile on GH200 — `NIM_MODEL_PROFILE`**
+**2. Reranker model profile on GH200 — `NIM_MODEL_PROFILE`**
 
 On GH200 (aarch64 + Hopper, cc 9.0) the only cc-9.0 reranker TensorRT plan is
 x86_64-built and fails to deserialize, and NIM auto-selects it anyway. Pin the
@@ -160,34 +133,6 @@ docker compose -f deploy/compose/compose.yaml up -d
 
 After all services report healthy, you can verify them with sample requests.
 
-#### Chat (GPT-OSS)
-
-```bash
-curl http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "gpt-oss-120b medium reasoning + CUDA knowledge",
-    "messages": [
-      {"role": "user", "content": "Write a CUDA kernel that applies ReLU to a float array."}
-    ],
-    "max_tokens": 1024
-  }'
-```
-
-### Code Completion
-
-```bash
-curl http://localhost:8080/v1/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "nvidia/CUDA-autocomplete",
-    "prompt": "<|fim_prefix|>__global__ void relu_kernel(float* out, const float* in, int n) {\n    int i = blockIdx.x * blockDim.x + threadIdx.x;\n    if (i < n) {\n        out[i] = <|fim_suffix|>;\n    }\n}\n<|fim_middle|>",
-    "max_tokens": 32,
-    "temperature": 0.01,
-    "stop": ["<|endoftext|>", "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>"]
-  }'
-```
-
 #### Reranking
 
 ```bash
@@ -211,7 +156,7 @@ curl -X POST "http://localhost:8020/v1/ranking" \
 
 ## Use the Blueprint
 
-Connect a client to the local backend to start using the blueprint.
+Connect an MCP client to the local backend to start using the blueprint.
 
 ### Connect from IDE
 
@@ -222,19 +167,23 @@ After the services are running on DGX Spark, connect from Visual Studio Code:
 2. Connect [NVIDIA Sync](https://docs.nvidia.com/dgx/dgx-spark/nvidia-sync.html) to DGX Spark.
 3. Select **VSCode** from NVIDIA Sync Apps. For more information, see NVIDIA's [Visual Studio Code on DGX Spark](https://build.nvidia.com/spark/vscode/overview)
    guide.
-4. After Visual Studio Code starts, install the
-   [Nsight Copilot Visual Studio Code extension](https://marketplace.visualstudio.com/items?itemName=NVIDIA.nsight-copilot)
-   from the Visual Studio Marketplace.
-5. Configure the Nsight Copilot extension to use the self-hosted backend: In Visual Studio Code, click on the Extensions tab -> find Nsight Copilot -> click on its gear icon -> click on Settings -> change `Server Origin` value to `http://localhost:8080`
-6. Forward DGX Spark port `8080` to local port `8080`: In Visual Studio Code,
+4. Add the MCP server: open the Command Palette and run **MCP: Add Server**. Select **HTTP**,
+   enter `http://localhost:8080/mcp/cuda-docs`, enter a server ID (for example
+   `nsight-copilot`), and select **Global**. For more information, see
+   [Add and manage MCP servers in VS Code](https://code.visualstudio.com/docs/copilot/customization/mcp-servers).
+5. Forward DGX Spark port `8080` to local port `8080`: In Visual Studio Code,
    open **Terminal** > **New Terminal**, switch to the **Ports** tab, and forward port `8080`.
    For more options, see the Visual Studio Code documentation for
    [port forwarding](https://code.visualstudio.com/docs/debugtest/port-forwarding) and
    [Remote SSH](https://code.visualstudio.com/docs/remote/ssh).
+6. Open Chat in agent mode and ask a CUDA question. Approve the `search_cuda_docs`
+   tool call when Visual Studio Code asks.
 
-#### VS Code-compatible forks
+#### Other IDEs
 
-Cursor, Windsurf, and VSCodium may work with additional extension-install and port-forwarding adjustments. These clients may not appear as native NVIDIA Sync apps. If the Visual Studio Marketplace is not available in the client, install the [Nsight Copilot extension from Open VSX](https://open-vsx.org/extension/NVIDIA/nsight-copilot), then configure `Server Origin` to `http://localhost:8080` and forward DGX Spark port `8080` to local port `8080`.
+Other MCP-capable IDEs and agents can also connect to
+`http://localhost:8080/mcp/cuda-docs`. They are not listed here. See the documentation
+of your client for how to add a remote HTTP MCP server.
 
 ### Forward ports over SSH
 
@@ -247,8 +196,8 @@ ssh -L 8080:localhost:8080 <user>@<host>
 ```
 
 Keep that session open; while it runs, `http://localhost:8080` on your machine
-reaches the server on the host. Point the extension `Server Origin` (or your API
-client) at `http://localhost:8080`.
+reaches the server on the host. Point your MCP client at
+`http://localhost:8080/mcp/cuda-docs`.
 
 To forward several ports at once — for example to hit an individual NIM directly —
 repeat `-L` (see [Service Ports](#service-ports) for the host ports):
@@ -266,8 +215,8 @@ ssh -fN -L 8080:localhost:8080 <user>@<host>
 
 `-L <local>:localhost:<remote>` maps a local port to the same port on the host's
 loopback, where Compose publishes the service. If a local port is taken, pick
-another and adjust `Server Origin` to match — e.g. `-L 8081:localhost:8080` with
-`Server Origin` set to `http://localhost:8081`.
+another and adjust the MCP client URL to match — e.g. `-L 8081:localhost:8080` with
+the client pointed at `http://localhost:8081/mcp/cuda-docs`.
 
 Verify a forwarded service from your machine — for example the rerank NIM on `8020`:
 
@@ -277,30 +226,19 @@ curl -s http://localhost:8020/v1/health/ready && echo OK
 
 ### Model Context Protocol (MCP)
 
-The Nsight Copilot server exposes an MCP endpoint at `http://localhost:8080/mcp/cuda-docs`
-(once port `8080` is forwarded from DGX Spark). It provides a single tool,
-`search_cuda_docs`, that performs semantic search over a curated corpus of NVIDIA CUDA
-documentation and code samples — current through early 2026, including libraries that
-post-date most model training cutoffs (such as cuTile). An MCP-capable client can call
-it to ground answers in current, authoritative CUDA material.
-
-#### Flow
-
-1. An MCP client (your IDE or agent) connects to `http://localhost:8080/mcp/cuda-docs`.
-2. The client calls `search_cuda_docs` with a natural-language query.
-3. The server retrieves matching documentation and code samples from the RAG
-   backend, reranks them, and returns the context to the client.
+The MCP endpoint provides one tool, `search_cuda_docs`. It does semantic search over a
+curated corpus of NVIDIA CUDA documentation and code samples — current through early 2026,
+including libraries that post-date most model training cutoffs (such as cuTile). The server
+retrieves matching documents from the RAG backend, reranks them, and returns them to the client.
 
 ## Service Ports
 
 | Service | Host Port | Description |
 |---------|-----------|-------------|
 | LiteLLM unified proxy | 8000 | OpenAI-compatible gateway for internal services |
-| GPT-OSS NIM | 8010 | Direct chat/reasoning NIM endpoint |
-| CUDA autocomplete NIM | 8011 | Direct fill-in-the-middle code completion endpoint |
 | Rerank NIM | 8020 | Direct reranking endpoint |
 | RAG server | 8030 | Direct CUDA document retrieval backend |
-| Nsight Copilot server | 8080 | Primary backend API for IDE clients and API users |
+| Nsight Copilot server | 8080 | MCP endpoint (`/mcp/cuda-docs`) |
 | Milvus | 19530, 9091 | Vector database and health endpoint |
 | SILO | 9000, 9001 | Object storage API and console |
 
@@ -313,11 +251,9 @@ In the default offline Compose deployment, prompts and code are served by local 
 | Symptom | Likely cause | What to check |
 |---------|--------------|---------------|
 | `docker pull` or NIM startup returns unauthorized | NGC key lacks required access | Re-run `docker login nvcr.io` and confirm the NGC key can pull `nvcr.io/nim/*` and `nvcr.io/nvidia/blueprint/*` images. |
-| Startup is slow or never completes | Services start one at a time (DGX Spark holds one model at a time), each gated on the previous passing its healthcheck plus a cache flush; first run also pulls model weights from NGC. A NIM that fails to initialize halts the whole chain and the main server never starts. | `docker compose ps` to see which service is currently `starting` or stuck `unhealthy` (or a `cache-flush`/`test-*` step that did not complete); `docker compose logs -f <service>` to follow it. First-run init is budgeted (GPT-OSS up to ~20 minutes) — if it is still progressing, wait; a service past its budget has genuinely failed. |
+| Startup is slow or never completes | Services start one at a time (DGX Spark holds one model at a time), each gated on the previous passing its healthcheck plus a cache flush; first run also pulls model weights from NGC. A NIM that fails to initialize halts the whole chain and the main server never starts. | `docker compose ps` to see which service is currently `starting` or stuck `unhealthy` (or a `cache-flush`/`test-*` step that did not complete); `docker compose logs -f <service>` to follow it. First-run init is budgeted — if it is still progressing, wait; a service past its budget has genuinely failed. |
 | Disk fills during setup | Docker images plus model caches exceed available space | Meet the Prerequisites free-disk requirement; move `OFFLINE_INFERENCE_DIR` to a larger disk if needed. |
-| NIM reports no compatible profile or memory pressure | Host GPU layout not recognized, or GPUs too small to hold a model on one device | The setup script auto-detects GPUs and tunes placement for single-GPU (DGX Spark) and multi-GPU hosts with a GPU ≥ 80 GB for the LLM plus a second GPU for the small models (see [Supported hardware](#supported-hardware)). When the GPUs are too small, the script stops — use suitable hardware or configure tensor-parallel serving manually. Confirm `nvidia-smi` reports the expected GPUs and memory; the setup script prints the chosen GPU placement profile during step 6. |
+| NIM reports no compatible profile or memory pressure | GPU 0 too small, or `BGE_GPU_MEM_UTIL` not raised on a discrete GPU | All models run on GPU 0 (see [Supported hardware](#supported-hardware)). When GPU 0 is too small, the script stops — use suitable hardware. Confirm `nvidia-smi` reports the expected GPUs and memory; the setup script prints the chosen GPU profile during step 6. |
 | GPU containers cannot see GPUs | NVIDIA Container Toolkit missing or unconfigured | Run `docker run --rm --runtime=nvidia --gpus all ubuntu nvidia-smi`. If it fails, see the [NVIDIA Container Toolkit troubleshooting guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/troubleshooting.html). |
-| No autocomplete suggestions in the IDE | Backend URL, port forwarding, or autocomplete service issue, or autocomplete toggle is off | Confirm the extension `Server Origin` is `http://localhost:8080`; confirm port `8080` is forwarded from DGX Spark to the client machine; check `docker compose ps autocomplete-nim litellm` shows both as `healthy`; verify autocomplete is enabled — click **Nsight Copilot** in the VS Code status bar (bottom-right) and ensure **Enable autocomplete** is on. |
-| Autocomplete suggestions are poor, distracting, or contain stray tokens | File language outside the model's primary training scope (CUDA, C++, Python), or autocomplete is not wanted for this session | The autocomplete model is fine-tuned mainly on CUDA, C++, and Python code; completion quality on other languages is limited. To disable inline suggestions, click **Nsight Copilot** in the VS Code status bar (bottom-right) and toggle **Enable autocomplete** off. The same menu re-enables it. |
-| MCP tools unavailable, or `search_cuda_docs` returns no context | The MCP endpoint is not reachable, or the RAG backend has no data | Confirm the MCP client points at `http://localhost:8080/mcp/cuda-docs` and that port `8080` is forwarded from DGX Spark to the client machine; confirm `docker compose ps rag-server-offline` is `healthy` and check its logs for retrieval errors. |
-| Port already in use | Another service is bound to the same port — either the published Compose port on DGX Spark, or the forwarded local port on the client | Identify which side collides. **On DGX Spark:** run `sudo ss -ltnp 'sport = :8080'` (or `sudo lsof -i :8080`) to find the pre-existing process holding the port; stop that process (recommended — DGX Spark resources are limited, so avoid a competing service) or, if it must keep running, change the published port in `deploy/compose/compose.yaml`. **On the client:** in the VS Code **Ports** tab, stop the process using the local port and re-forward, or edit the **Local Address** to a free port (for example `8081`) and update the extension `Server Origin` to match (`http://localhost:8081`). |
+| MCP tools unavailable, or `search_cuda_docs` returns no context | The MCP endpoint is not reachable, or the RAG backend has no data | Confirm the MCP client uses the endpoint URL from [Use the Blueprint](#use-the-blueprint). If the client runs on a different machine than the host, confirm the SSH tunnel is open: `curl -s http://localhost:8080/healthcheck` on the client machine must succeed; confirm `docker compose ps rag-server-offline` is `healthy` and check its logs for retrieval errors. |
+| Port already in use | Another service is bound to the same port — either the published Compose port on DGX Spark, or the forwarded local port on the client | Identify which side collides. **On DGX Spark:** run `sudo ss -ltnp 'sport = :8080'` (or `sudo lsof -i :8080`) to find the pre-existing process holding the port; stop that process (recommended — DGX Spark resources are limited, so avoid a competing service) or, if it must keep running, change the published port in `deploy/compose/compose.yaml`. **On the client:** stop the process using the local port and re-forward, or forward to a free local port (for example `ssh -L 8081:localhost:8080 <user>@<host>`) and update the MCP client URL to match (`http://localhost:8081/mcp/cuda-docs`). |

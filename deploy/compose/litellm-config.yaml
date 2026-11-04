@@ -1,14 +1,4 @@
 model_list:
-  - model_name: nvdev/sw-gpu/gpt-oss-120b
-    litellm_params:
-      model: hosted_vllm/openai/gpt-oss-120b
-      api_base: http://gpt-oss-nim:8000/v1
-      api_key: ""
-  - model_name: nvdev/sw-gpu/qwen-2.5-7b-atlas
-    litellm_params:
-      model: hosted_vllm/nvdev/sw-gpu/qwen-2.5-7b-atlas
-      api_base: http://autocomplete-nim:8000/v1
-      api_key: ""
   - model_name: nvdev/sw-gpu/bge-m3
     litellm_params:
       model: hosted_vllm//models/bge-m3
