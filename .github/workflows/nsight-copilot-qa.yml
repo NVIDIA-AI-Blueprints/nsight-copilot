@@ -1,11 +1,11 @@
 # Deploys the Nsight Copilot (self-hosted / offline inference) stack via Docker
 # Compose, waits for the inference services and the primary backend to become
-# healthy, exercises the OpenAI-compatible endpoints, then runs the Nsight
-# Copilot test suite from the shared QA image.
+# healthy, probes the MCP endpoint (/mcp/cuda-docs) and the model services, then
+# runs the Nsight Copilot test suite from the shared QA image.
 #
-# This blueprint loads its models one at a time on start (single/multi-GPU with
-# memory freed between loads); GPT-OSS alone can take ~15-20 min to initialize,
-# so the readiness waits below are generous and the job timeout is large.
+# This blueprint loads its models one at a time on start (memory is freed
+# between loads), and the first run downloads the weights from NGC, so the
+# readiness waits below are generous and the job timeout is large.
 #
 # Required repository secrets:
 #   NGC_API_KEY            NVIDIA API key used to pull NIM images from nvcr.io
@@ -42,7 +42,7 @@ jobs:
       OFFLINE_INFERENCE_DIR: ${{ github.workspace }}/nsc-offline
       # Endpoints published by the compose stack (see docs "Service Ports").
       GATEWAY_URL: http://localhost:8000   # LiteLLM OpenAI-compatible gateway
-      SERVER_URL: http://localhost:8080    # Nsight Copilot primary backend
+      SERVER_URL: http://localhost:8080    # Nsight Copilot MCP server
       RERANK_URL: http://localhost:8020    # Rerank NIM
       RAG_URL: http://localhost:8030       # RAG retrieval backend
     steps:
@@ -64,20 +64,11 @@ jobs:
           export USER_ID="$(id -u)"
           mkdir -p "${OFFLINE_INFERENCE_DIR}/nim"
 
-          # GPU placement: this runner has 2 discrete GPUs (>=80 GB each, as
-          # gpt-oss-120b requires), so mirror the setup script's multi-GPU layout:
-          # dedicate GPU 0 to the LLM and put the small models (autocomplete, bge,
-          # rerank) on GPU 1. Discrete GPUs use the 2.0.7 gpt-oss image; 1.6.1 is only
-          # for unified-memory DGX Spark. If a run shows the LLM out of memory, the
-          # GPUs are smaller than assumed - revisit this layout.
-          export GPT_OSS_IMAGE_TAG=2.0.7
-          export GPT_OSS_GPU=0
-          export GPT_OSS_KVCACHE_PERCENT=0.9
-          export AUTOCOMPLETE_GPU=1
-          export AUTOCOMPLETE_GPU_MEM_UTIL=0.3
-          export BGE_GPU=1
+          # GPU placement: compose pins both models (bge-m3 and rerank) to GPU 0.
+          # The compose default for the embedding memory fraction is sized for the
+          # DGX Spark unified pool; on this runner's discrete >=80 GB GPU, raise it
+          # as the setup script does (see docs "Platform-specific settings").
           export BGE_GPU_MEM_UTIL=0.05
-          export RERANK_GPU=1
 
           echo "${NGC_API_KEY}" | docker login nvcr.io -u '$oauthtoken' --password-stdin
 
@@ -106,8 +97,8 @@ jobs:
             exit 1
           fi
 
-          echo "Waiting for the Nsight Copilot primary backend on :8080 (up to 10 min)..."
-          if ! timeout 600 bash -c 'until curl -fsS -o /dev/null "${SERVER_URL}/openapi.json"; do sleep 10; done'; then
+          echo "Waiting for the Nsight Copilot server on :8080 (up to 10 min)..."
+          if ! timeout 600 bash -c 'until curl -fsS -o /dev/null "${SERVER_URL}/healthcheck"; do sleep 10; done'; then
             echo "::error::Nsight Copilot backend (:8080) did not answer within 10 minutes."
             docker compose -f "${COMPOSE_FILE}" ps --all
             exit 1
@@ -125,27 +116,72 @@ jobs:
           # body exceeds 1000 bytes: head closes the pipe early, curl dies with
           # SIGPIPE (141), and pipefail propagates that. Slicing a variable avoids
           # the SIGPIPE while still letting `curl -f` abort on an HTTP error.
-          echo "== Chat (GPT-OSS) via primary backend :8080 =="
-          chat_resp="$(curl -fsS "${SERVER_URL}/v1/chat/completions" \
-            -H "Content-Type: application/json" \
-            -d '{
-              "model": "gpt-oss-120b medium reasoning + CUDA knowledge",
-              "messages": [{"role": "user", "content": "Write a CUDA kernel that applies ReLU to a float array."}],
-              "max_tokens": 256
-            }')"
-          echo "${chat_resp:0:1000}"
+          echo "== Nsight Copilot health :8080 =="
+          health_resp="$(curl -fsS "${SERVER_URL}/healthcheck")"
+          echo "${health_resp:0:1000}"
+          grep -Eq '"status" *: *"healthy"' <<< "${health_resp}" \
+            || { echo "::error::Nsight Copilot server is not healthy."; exit 1; }
 
-          echo "== Code completion (CUDA-autocomplete) via primary backend :8080 =="
-          completion_resp="$(curl -fsS "${SERVER_URL}/v1/completions" \
+          # MCP over streamable HTTP: POST JSON-RPC, accept JSON or SSE, and
+          # carry the Mcp-Session-Id header if the server sets one. An SSE reply
+          # puts the JSON-RPC message on its "data:" lines.
+          mcp_url="${SERVER_URL}/mcp/cuda-docs"
+          mcp_session=""
+          mcp_post() {
+            local headers body session
+            local -a session_header=()
+            if [ -n "${mcp_session}" ]; then
+              session_header=(-H "Mcp-Session-Id: ${mcp_session}")
+            fi
+            headers="$(mktemp)"
+            body="$(curl -fsS -D "${headers}" -X POST "${mcp_url}" \
+              -H "Content-Type: application/json" \
+              -H "Accept: application/json, text/event-stream" \
+              -H "MCP-Protocol-Version: 2025-06-18" \
+              "${session_header[@]}" \
+              -d "$1")"
+            session="$(tr -d '\r' < "${headers}" | sed -n 's/^[Mm][Cc][Pp]-[Ss]ession-[Ii][Dd]: *//p' | tail -n 1)"
+            rm -f "${headers}"
+            if [ -n "${session}" ]; then mcp_session="${session}"; fi
+            body="$(tr -d '\r' <<< "${body}")"
+            if grep -q '^data:' <<< "${body}"; then
+              body="$(sed -n 's/^data: \{0,1\}//p' <<< "${body}")"
+            fi
+            mcp_resp="${body}"
+          }
+
+          echo "== MCP initialize :8080/mcp/cuda-docs =="
+          mcp_post '{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "blueprint-qa", "version": "1.0"}}}'
+          echo "${mcp_resp:0:1000}"
+          grep -q '"serverInfo"' <<< "${mcp_resp}" \
+            || { echo "::error::MCP initialize did not return serverInfo."; exit 1; }
+          mcp_post '{"jsonrpc": "2.0", "method": "notifications/initialized"}'
+
+          echo "== MCP tools/list =="
+          mcp_post '{"jsonrpc": "2.0", "id": 2, "method": "tools/list"}'
+          echo "${mcp_resp:0:1000}"
+          grep -Eq '"name" *: *"search_cuda_docs"' <<< "${mcp_resp}" \
+            || { echo "::error::MCP tools/list does not include search_cuda_docs."; exit 1; }
+
+          echo "== MCP tools/call search_cuda_docs =="
+          mcp_post '{"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "search_cuda_docs", "arguments": {"query": "How does __syncthreads synchronize threads in a CUDA thread block?"}}}'
+          echo "${mcp_resp:0:1000}"
+          if grep -Eq '"isError" *: *true' <<< "${mcp_resp}" \
+            || ! grep -Eq '"text" *: *"[^"]' <<< "${mcp_resp}"; then
+            echo "::error::search_cuda_docs returned an error or no text."
+            exit 1
+          fi
+
+          echo "== Embeddings (bge-m3) via LiteLLM gateway :8000 =="
+          embed_resp="$(curl -fsS -X POST "${GATEWAY_URL}/v1/embeddings" \
             -H "Content-Type: application/json" \
             -d '{
-              "model": "nvidia/CUDA-autocomplete",
-              "prompt": "<|fim_prefix|>__global__ void relu(float* o, const float* i, int n) {\n  int t = blockIdx.x * blockDim.x + threadIdx.x;\n  if (t < n) o[t] = <|fim_suffix|>;\n}\n<|fim_middle|>",
-              "max_tokens": 32,
-              "temperature": 0.01,
-              "stop": ["<|endoftext|>", "<|fim_prefix|>", "<|fim_middle|>", "<|fim_suffix|>"]
+              "model": "nvdev/sw-gpu/bge-m3",
+              "input": ["How do I launch a CUDA kernel?"]
             }')"
-          echo "${completion_resp:0:1000}"
+          echo "${embed_resp:0:300}"
+          grep -q '"embedding"' <<< "${embed_resp}" \
+            || { echo "::error::Embeddings response has no embedding."; exit 1; }
 
           echo "== Reranking NIM :8020 =="
           rerank_resp="$(curl -fsS -X POST "${RERANK_URL}/v1/ranking" \
@@ -160,7 +196,7 @@ jobs:
             }')"
           echo "${rerank_resp:0:1000}"
 
-          echo "Inference endpoints are responding."
+          echo "MCP and inference endpoints are responding."
 
       # The endpoint probe above performs live inference. Give the shared
       # inference stack a brief cooldown before the browser/API test suite runs.
@@ -199,7 +235,7 @@ jobs:
             > ci-diagnostics/docker-compose-ps.txt 2>&1 || true
           docker compose -f "${COMPOSE_FILE}" logs \
             --no-color --timestamps --tail 300 \
-            litellm gpt-oss-nim autocomplete-nim rerank-nim vllm-bge \
+            litellm rerank-nim vllm-bge \
             rag-server-offline nsight-copilot-offline \
             standalone etcd minio \
             > ci-diagnostics/service-logs.txt 2>&1 || true
